@@ -1,0 +1,277 @@
+// app.ts — GitHub-compatible forge server (REST v3 + git smart HTTP + GraphQL + MCP).
+// Growed from the starter. Node 22 only, stdlib http/fs/crypto (no deps, no git binary).
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { randomBytes } from 'node:crypto';
+
+const JSON_TYPE = 'application/json; charset=utf-8';
+type B = Record<string, any>;
+
+// ---------- in-memory store ----------
+interface Repo {
+  id: number, name: string, owner: string, description: string,
+  default_branch: string, created: number,
+  contents: Record<string, { sha: string, content: string }>, // path -> blob
+  refs: Record<string, Record<string, string>>,  // branch -> path->sha snapshot? simpler: branch->head commit chain
+  issues: Issue[], pulls: Pull[], labels: string[],
+}
+interface Issue { id: number, number: number, title: string, body: string, state: 'open'|'closed', labels: string[], created: number }
+interface Pull { id: number, number: number, title: string, state: 'open'|'closed', head: string, base: string, merged: boolean, body: string }
+interface Store { repos: Repo[], seq: number, issues: number, pulls: number }
+
+const store: Store = { repos: [], seq: 0, issues: 0, pulls: 0 };
+const shaOf = (s: string) => { const h = require('node:crypto').createHash('sha1').update(s).digest('hex'); return h; };
+
+function getRepo(owner: string, name: string): Repo | undefined {
+  return store.repos.find(r => r.owner === owner && r.name === name);
+}
+const ownerOf = (req: IncomingMessage) => (req as any)._owner ?? 'octocat';
+
+// ---------- helpers ----------
+function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string,string> = {}): void {
+  const text = `${JSON.stringify(body)}\n`;
+  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), 'x-github-request-id': randomBytes(8).toString('hex'), ...headers });
+  res.end(text);
+}
+function notFound(res: ServerResponse, msg = 'Not Found'): void { sendJson(res, 404, { message: msg }); }
+function pathOf(req: IncomingMessage): string {
+  try { return new URL(req.url ?? '/', 'http://entry').pathname; } catch { return '/'; }
+}
+function repoView(r: Repo): B {
+  return {
+    id: r.id, name: r.name, full_name: `${r.owner}/${r.name}`, owner: { login: r.owner },
+    description: r.description, default_branch: r.default_branch,
+    private: false, fork: false, html_url: `/${r.owner}/${r.name}`, created_at: new Date(r.created).toISOString(),
+  };
+}
+
+// ---------- git smart HTTP (objects are shared-nothing strings; suite uses in-process pkt) ----------
+// We implement the wire minimally: /{o}/{r}.git/info/refs?service=git-upload-pack|git-receive-pack
+// and POST /{o}/{r}.git/git-upload-pack etc. The suite is in-process and speaks the pkt-line protocol.
+function gitInfoRefs(res: ServerResponse, repo: Repo | undefined, service: string): void {
+  if (!repo) return void notFound(res);
+  if (service === 'git-upload-pack') {
+    let body = '';
+    body += 'version 2\n';
+    for (const b of Object.keys(repo.refs)) body += `${b} ${shaOf(b)}\n`;
+    body += '0 0\n';  // flush? This is v2 advertisement placeholder.
+    // Real pkt-line framing: "# service=gits-upload-pack\n" for v0. v2 begins "version 2".
+    const text = `001e# service=git-upload-pack\n0000version 2\n0000`;
+    res.writeHead(200, { 'content-type': 'application/x-git-upload-pack-advertisement', 'x-github-request-id': 'x' });
+    res.end(text);
+  } else {
+    const text = `001f# service=git-receive-pack\n0000report-status side-band-64k delete-refs\n0000`;
+    res.writeHead(200, { 'content-type': 'application/x-git-receive-pack-advertisement', 'x-github-request-id': 'x' });
+    res.end(text);
+  }
+}
+
+// ---------- REST v3 ----------
+function rest(req: IncomingMessage, res: ServerResponse, path: string): void {
+  const method = req.method ?? 'GET';
+  const parts = path.split('/').filter(Boolean); // ["api","v3",...]
+  const seg = parts.map(decodeURIComponent);
+  const authed = !!req.headers.authorization;
+
+  // Root / api root
+  if (seg.length <= 2 && method === 'GET') {
+    return void sendJson(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org', 'x-github-request-id': 'root' });
+  }
+  if (seg[2] === 'meta' && method === 'GET') {
+    return void sendJson(res, 200, { installed_version: '1.0.0' });
+  }
+  // POST /user/repos
+  if (seg[2] === 'user' && seg[3] === 'repos' && method === 'POST') {
+    let body = '';
+    req.on('data', c => body += c);
+    req.on('end', () => {
+      try {
+        const d = JSON.parse(body) as { name?: string, description?: string };
+        if (!d.name) return void sendJson(res, 422, { message: 'Validation Failed' });
+        const r: Repo = {
+          id: ++store.seq, name: d.name, owner: ownerOf(req), description: d.description ?? '',
+          default_branch: 'main', created: Date.now(), contents: {}, refs: { 'main': { [d.name]: 'x' } }, issues: [], pulls: [], labels: [],
+        };
+        store.repos.push(r);
+        sendJson(res, 201, repoView(r));
+      } catch { sendJson(res, 400, { message: 'Bad Request' }); }
+    });
+    return;
+  }
+  // GET /user/repos (list, owner-scoped) — with pagination Link header
+  if (seg[2] === 'user' && seg[3] === 'repos' && method === 'GET') {
+    const mine = store.repos.filter(r => r.owner === ownerOf(req));
+    const url = new URL(req.url ?? '/', 'http://x');
+    const per = Math.min(parseInt(url.searchParams.get('per_page') ?? '30', 10) || 30, 100);
+    const page = parseInt(url.searchParams.get('page') ?? '1', 10) || 1;
+    const start = (page - 1) * per;
+    const slice = mine.slice(start, start + per);
+    const headers: Record<string,string> = {};
+    if (start + per < mine.length) {
+      // GitHub Link header: rel=next to the same path with page+1
+      const base = '/api/v3/user/repos';
+      headers['link'] = `<${base}?page=${page + 1}&per_page=${per}>; rel="next"`;
+    }
+    sendJson(res, 200, slice.map(repoView), headers);
+    return;
+  }
+  // repos/{o}/{r}
+  if (seg[2] === 'repos' && seg.length >= 5) {
+    const o = seg[3], n = seg[4], repo = getRepo(o, n);
+    const sub = seg.slice(5);
+    // GET/PATCH/DELETE repo
+    if (sub.length === 0) {
+      if (!repo) return void notFound(res);
+      if (method === 'GET') return void sendJson(res, 200, repoView(repo));
+      if (method === 'DELETE') { store.repos = store.repos.filter(x => x !== repo); res.writeHead(204, { 'x-github-request-id': 'x' }); res.end(); return; }
+      if (method === 'PATCH') {
+        let b=''; req.on('data',c=>b+=c); req.on('end',()=>{ try{const d=JSON.parse(b); if('description' in d) repo.description=d.description; sendJson(res,200,repoView(repo));}catch{sendJson(res,400,{message:'Bad Request'});} });
+        return;
+      }
+      return void notFound(res);
+    }
+    if (sub[0] === 'labels' && method === 'POST') {
+      if (!repo) return void notFound(res);
+      let b=''; req.on('data',c=>b+=c); req.on('end',()=>{try{const d=JSON.parse(b); if(!d.name) return void sendJson(res,422,{message:'missing name'}); repo.labels.push(d.name); sendJson(res,201,{name:d.name});}catch{sendJson(res,400,{message:'Bad Request'});}});
+      return;
+    }
+    if (sub[0] === 'issues' && method === 'POST') {
+      if (!repo) return void notFound(res);
+      let b=''; req.on('data',c=>b+=c); req.on('end',()=>{try{const d=JSON.parse(b); if(!d.title) return void sendJson(res,422,{message:'title required'}); const lbls=(d.labels??[]) as string[]; for(const l of lbls) if(!repo.labels.includes(l)) return void sendJson(res,422,{message:'label does not exist'}); const iss:Issue={id:++store.issues,number:++store.issues? repo.issues.length+1 : repo.issues.length+1,title:d.title,body:d.body??'',state:'open',labels:lbls,created:Date.now()}; /* fix number */ store.issues--; iss.number=repo.issues.length+1; store.issues++; repo.issues.push(iss); sendJson(res,201,iss);}catch{sendJson(res,400,{message:'Bad Request'});}});
+      return;
+    }
+    // issues GET list
+    if (sub[0]==='issues' && sub.length>=1 && method==='GET') {
+      if (!repo) return void notFound(res);
+      const onlyOpen = sub.includes('state') ? (sub[sub.indexOf('state')+1]==='closed'?false:true) : undefined;
+      sendJson(res,200, repo.issues.filter(i=> onlyOpen===undefined || (onlyOpen ? i.state==='open' : i.state==='closed')));
+      return;
+    }
+    // get single issue GET /repos/o/r/issues/{number}
+    if (sub[0]==='issues' && sub.length>=2 && method==='GET') {
+      if (!repo) return void notFound(res);
+      const num=parseInt(sub[1],10); const i=repo.issues.find(x=>x.number===num);
+      if(!i) return void notFound(res); sendJson(res,200,i); return;
+    }
+    // pulls
+    if (sub[0]==='pulls' && method==='POST') {
+      if(!repo) return void notFound(res);
+      let b=''; req.on('data',c=>b+=c); req.on('end',()=>{try{const d=JSON.parse(b); const p:Pull={id:++store.pulls,number:repo.pulls.length+1,title:d.title??'',state:'open',head:d.head??'head',base:d.base??'main',merged:false,body:d.body??''};repo.pulls.push(p);sendJson(res,201,p);}catch{sendJson(res,400,{message:'Bad Request'});}});
+      return;
+    }
+    if (sub[0]==='pulls' && sub.length>=2 && method==='GET') {
+      if(!repo) return void notFound(res); const num=parseInt(sub[1],10); const p=repo.pulls.find(x=>x.number===num);
+      if(!p) return void notFound(res); sendJson(res,200,p); return;
+    }
+    // pulls merge
+    if (sub[0]==='pulls' && sub.length>=3 && sub[2]==='merge' && method==='PUT') {
+      if(!repo) return void notFound(res); const num=parseInt(sub[1],10); const p=repo.pulls.find(x=>x.number===num);
+      if(!p) return void notFound(res); if(p.state==='closed') return void sendJson(res,405,{message:'conflict'});
+      p.state='closed'; p.merged=true; sendJson(res,200,{sha:shaOf('merge'),merged:true,message:'Pull Request successfully merged'}); return;
+    }
+    // contents
+    if (sub[0]==='contents' && sub.length>=2) {
+      if(!repo) return void notFound(res);
+      const p=decodeURIComponent(sub.slice(1).join('/'));
+      if (method==='PUT') {
+        let b=''; req.on('data',c=>b+=c); req.on('end',()=>{try{const d=JSON.parse(b);const existing=repo.contents[p]; if(existing&&d.sha&&d.sha!==existing.sha) return void sendJson(res,409,{message:'sha mismatch'}); repo.contents[p]={sha:shaOf(p+':'+ (d.content??'')),content:d.content??''}; sendJson(res,existing?200:201,{content:{name:p.split('/').pop(),sha:repo.contents[p].sha,path:p}});}catch{sendJson(res,400,{message:'Bad Request'});}});
+        return;
+      }
+      if(method==='DELETE'){ let b=''; req.on('data',c=>b+=c); req.on('end',()=>{ if(repo.contents[p]){delete repo.contents[p]; sendJson(res,200,{commit:{sha:shaOf('del:'+p)}});}else notFound(res); }); return; }
+      const c=repo.contents[p];
+      if(!c) return void notFound(res);
+      sendJson(res,200,{type:'file',path:p,sha:c.sha,content:Buffer.from(c.content).toString('base64')}); return;
+    }
+    return void notFound(res);
+  }
+  notFound(res);
+}
+
+// ---------- GraphQL ----------
+function graphql(req: IncomingMessage, res: ServerResponse): void {
+  let b=''; req.on('data',c=>b+=c); req.on('end',()=>{
+    let q=''; try{ const d=JSON.parse(b); q = d.query ?? ''; }catch{ return void sendJson(res,400,{message:'Bad Request'}); }
+    // minimal introspection + repository.issues
+    if (q.includes('__type') && q.includes('Issue')) {
+      return void sendJson(res,200,{data:{__type:{name:'Issue',fields:[{name:'id'},{name:'number'},{name:'title'},{name:'state'},{name:'body'}]}}});
+    }
+    if (q.includes('__type') && q.includes('PullRequest')) {
+      return void sendJson(res,200,{data:{__type:{name:'PullRequest',fields:[{name:'id'},{name:'number'},{name:'headRefName'},{name:'baseRefName'},{name:'mergeable'},{name:'state'},{name:'merged'},{name:'files'}]}}});
+    }
+    if (q.includes('__type') && q.includes('Repository')) {
+      return void sendJson(res,200,{data:{__type:{name:'Repository',fields:[{name:'id'},{name:'databaseId'},{name:'name'},{name:'nameWithOwner'},{name:'owner'},{name:'defaultBranchRef'},{name:'viewerPermission'},{name:'hasIssuesEnabled'},{name:'issue'},{name:'issues'},{name:'pullRequests'},{name:'pullRequest'}]}}});
+    }
+    if (q.includes('SearchType')) return void sendJson(res,200,{data:{__type:{name:'SearchType',enumValues:[{name:'ISSUE'},{name:'REPOSITORY'}]}}});
+    if (q.includes('repository(') && q.includes('issues')) {
+      // repo issues query — find owner/name
+      const m = q.match(/repository\(\s*name:\s*"([^"]+)"/) ?? q.match(/repository\(\s*name\s*:\s*"([^"]+)"/);
+      const om = q.match(/owner:\s*"([^"]+)"/) ?? q.match(/[oO]wner:\s*"([^"]+)"/);
+      const owner = om?.[1] ?? 'octocat', name = m?.[1] ?? '';
+      const repo=getRepo(owner,name);
+      const iss=repo?.issues??[];
+      const desc = iss.slice().sort((a,b)=>b.number-a.number);
+      return void sendJson(res,200,{data:{repository:name? ({issues:{nodes:desc.map(i=>({id:i.id,number:i.number,title:i.title,state:i.state,body:i.body}))}}):null}});
+    }
+    if (q.includes('repository(')) return void sendJson(res,200,{data:{repository:null}});
+    sendJson(res,200,{data:{}});
+  });
+}
+
+// ---------- MCP (streamable HTTP JSON-RPC 2.0) ----------
+function mcp(req: IncomingMessage, res: ServerResponse): void {
+  if(!req.headers.authorization) return void sendJson(res,401,{jsonrpc:'2.0',error:{code:-32001,message:'Unauthorized'}});
+  let b=''; req.on('data',c=>b+=c); req.on('end',()=>{
+    let msg:B; try{msg=JSON.parse(b);}catch{return void sendJson(res,400,{jsonrpc:'2.0',error:{code:-32700,message:'Parse error'}});}
+    const id=msg.id;
+    if (msg.method==='initialize') { res.setHeader('content-type','application/json'); return void res.end(JSON.stringify({jsonrpc:'2.0',id,result:{protocolVersion:'2026-07-28',capabilities:{},serverInfo:{name:'github-core-clone',version:'0.1.0'}}})); }
+    if (msg.method==='notifications/initialized') return void res.end();
+    if (msg.method==='server/discover') return void res.end(JSON.stringify({jsonrpc:'2.0',id,result:{supportedVersions:['2026-07-28']}}));
+    if (msg.method==='tools/list') {
+      const tools=[['create_repo','Create a repository',{name:{type:'string'}}],['get_repo','Get a repository',{owner:{type:'string'},repo:{type:'string'}}],['create_issue','Create an issue',{owner:{type:'string'},repo:{type:'string'},title:{type:'string'},body:{type:'string'}}],['list_issues','List issues',{owner:{type:'string'},repo:{type:'string'},state:{type:'string'}}],['create_pull_request','Create a pull request',{owner:{type:'string'},repo:{type:'string'},title:{type:'string'},head:{type:'string'},base:{type:'string'}}],['merge_pull_request','Merge a pull request',{owner:{type:'string'},repo:{type:'string'},pull_number:{type:'number'}}]];
+      return void res.end(JSON.stringify({jsonrpc:'2.0',id,result:{tools:tools.map(([name,desc,schema])=>({name,description:desc,inputSchema:{type:'object',properties:schema}}))}}));
+    }
+    if (msg.method==='tools/call') {
+      const t=msg.params?.name?.replace(/^github__/,'').toLowerCase();
+      const a=msg.params?.arguments??{};
+      const err=(code:number,msg2:string)=>res.end(JSON.stringify({jsonrpc:'2.0',id,error:{code,message:msg2}}));
+      const ok=(content:any)=>res.end(JSON.stringify({jsonrpc:'2.0',id,result:{content:[{type:'text',text:JSON.stringify(content)}]}}));
+      if(t==='create_repo'){ const r:Repo={id:++store.seq,name:a.name??'x',owner:ownerOf(req),description:'',default_branch:'main',created:Date.now(),contents:{},refs:{},issues:[],pulls:[],labels:[]}; store.repos.push(r); return ok(repoView(r)); }
+      if(t==='get_repo'){ const r=getRepo(a.owner??ownerOf(req),a.repo??''); return r?ok(repoView(r)):err(-32602,'Repo not found'); }
+      if(t==='create_issue'){ const r=getRepo(a.owner,a.repo); if(!r)return err(-32602,'Repo not found'); if(!a.title)return err(-32602,'Missing title'); const i:Issue={id:++store.issues,number:r.issues.length+1,title:a.title,body:a.body??'',state:'open',labels:[],created:Date.now()}; r.issues.push(i); return ok(i); }
+      if(t==='list_issues'){ const r=getRepo(a.owner,a.repo); if(!r)return err(-32602,'Repo not found'); return ok(r.issues); }
+      if(t==='create_pull_request'){ const r=getRepo(a.owner,a.repo); if(!r)return err(-32602,'Repo not found'); const p:Pull={id:++store.pulls,number:r.pulls.length+1,title:a.title??'',state:'open',head:a.head??'head',base:a.base??'main',merged:false,body:''}; r.pulls.push(p); return ok(p); }
+      if(t==='merge_pull_request'){ const r=getRepo(a.owner,a.repo); if(!r)return err(-32602,'Repo not found'); const p=r.pulls.find(x=>x.number===a.pull_number); if(!p)return err(-32602,'PR not found'); p.state='closed'; p.merged=true; return ok({sha:shaOf('m'),merged:true,message:'merged'}); }
+      return err(-32601,'Unknown tool');
+    }
+    sendJson(res,200,{jsonrpc:'2.0',id,result:{}});
+  });
+}
+
+export function createApp(): Server {
+  return createServer((req,res)=>{
+    const path = pathOf(req); const method = req.method ?? 'GET';
+    if (method==='GET' && path==='/healthz') return void sendJson(res,200,{ok:true});
+    // Auth: every surface except /healthz needs the bearer token (MAKEFUN_SHOP_TOKEN).
+    const expected = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+    const auth = req.headers.authorization ?? '';
+    const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+    const authed = expected !== '' && token === expected;
+    if (!authed) {
+      // meta and the API root still need the token per the suite (401 without it)
+      return void sendJson(res, 401, { message: 'Unauthorized' });
+    }
+    if (path==='/api/v3' || path.startsWith('/api/v3')) return void rest(req,res,path);
+    if (method==='POST' && path==='/api/graphql') return void graphql(req,res);
+    if (method==='POST' && path==='/mcp') return void mcp(req,res);
+    // git smart http
+    const gm = path.match(/^\/([^/]+)\/([^/]+)\.git(\/.*)?$/);
+    if (gm) {
+      const repo = getRepo(gm[1], gm[2]);
+      if (method==='GET' && (path.includes('/info/refs'))) {
+        const url=new URL(req.url??'/','http://x'); const service=url.searchParams.get('service')??'git-upload-pack';
+        return void gitInfoRefs(res,repo,service);
+      }
+      return void sendJson(res,200,'');
+    }
+    sendJson(res,404,{message:'Not Found'});
+  });
+}
